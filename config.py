@@ -13,6 +13,14 @@ BOT_TOKEN = _get("BOT_TOKEN")
 PIARFLOW_API_KEY = _get("PIARFLOW_API_KEY")
 DATABASE_URL = _get("DATABASE_URL")
 
-# Список админов через запятую: "766347597,8824689369"
 ADMIN_IDS = [int(x.strip()) for x in _get("ADMIN_IDS").split(",")]
 PORT = int(os.getenv("PORT", "8080"))
+
+# Награда за ОДНО автоматическое задание PiarFlow (внутренние звезды)
+PIARFLOW_REWARD = 0.10
+# Бонус рефереру
+REFERRAL_BONUS = 5.0
+# Сколько заданий должен выполнить реферал, чтобы реферер получил бонус
+REFERRAL_TASKS_REQUIRED = 5
+# Имя бота для реферальных ссылок
+BOT_USERNAME = "StarsMineAi"
