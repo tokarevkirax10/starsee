@@ -16,8 +16,8 @@ STRINGS = {
         "tasks_auto": "⚡️ Автоматические",
         "tasks_manual": "📸 Ручные",
         "auto_tasks_empty": "📸 Автоматических заданий пока нет.",
-        "auto_tasks_ready": "⚡️ Автоматические задания\n\nВыполни задания ниже и нажми «Проверить»:\n\n{}",
-        "auto_tasks_check": "✅ Проверить",
+        "auto_tasks_ready": "⚡️ Автоматические задания\n\nВыполни задания ниже и нажми «Проверить».",
+        "auto_tasks_check": "🔄 Проверить",
         "auto_tasks_success": "✅ Все задания выполнены! Начислено {} ⭐️",
         "auto_tasks_fail": "❌ Не все задания выполнены. Проверь подписки и попробуй снова.",
         "profile_title": "📊 Профиль",
@@ -62,7 +62,6 @@ STRINGS = {
         "admin_no_tasks": "Нет заданий для удаления.",
         "admin_stats": "📊 Статистика бота\n\n👥 Всего юзеров: {}\n💰 Общий баланс юзеров: {} ⭐️\n💸 Всего заработано: {} ⭐️\n⏳ Заявок на проверке: {}",
         
-        # Рефералка
         "ref_title": "👥 Реферальная программа",
         "ref_desc": "Приглашай друзей и получай {} ⭐️ за каждого, кто выполнит {} заданий!",
         "ref_link": "🔗 Твоя ссылка:\n`{}`",
@@ -86,8 +85,8 @@ STRINGS = {
         "tasks_auto": "⚡️ Automatic",
         "tasks_manual": "📸 Manual",
         "auto_tasks_empty": "📸 No automatic tasks yet.",
-        "auto_tasks_ready": "⚡️ Automatic Tasks\n\nComplete tasks below and click 'Check':\n\n{}",
-        "auto_tasks_check": "✅ Check",
+        "auto_tasks_ready": "⚡️ Automatic Tasks\n\nComplete tasks below and click 'Check'.",
+        "auto_tasks_check": "🔄 Check",
         "auto_tasks_success": "✅ All tasks completed! Credited {} ⭐️",
         "auto_tasks_fail": "❌ Not all tasks completed. Check subscriptions and try again.",
         "profile_title": "📊 Profile",
@@ -132,7 +131,6 @@ STRINGS = {
         "admin_no_tasks": "No tasks to delete.",
         "admin_stats": "📊 Bot Stats\n\n👥 Total users: {}\n💰 Total user balances: {} ⭐️\n💸 Total earned: {} ⭐️\n⏳ Pending submissions: {}",
         
-        # Referrals
         "ref_title": "👥 Referral Program",
         "ref_desc": "Invite friends and get {} ⭐️ for each who completes {} tasks!",
         "ref_link": "🔗 Your link:\n`{}`",

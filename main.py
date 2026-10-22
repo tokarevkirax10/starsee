@@ -175,10 +175,13 @@ async def auto_tasks_list(cb: types.CallbackQuery):
     links = [s["link"] for s in sponsors]
     user_pending_links[user['user_id']] = links
     
-    text = t("auto_tasks_ready", lang).format("\n".join([f"🔹 {link}" for link in links]))
+    # Убрали вывод длинных ссылок в текст!
+    text = t("auto_tasks_ready", lang)
+    
     b = InlineKeyboardBuilder()
     for s in sponsors:
-        b.row(InlineKeyboardButton(text=f"🔍 Перейти", url=s["link"]))
+        # Заменили эмодзи на ракету
+        b.row(InlineKeyboardButton(text=f"🚀 Перейти", url=s["link"]))
     b.row(InlineKeyboardButton(text=t("auto_tasks_check", lang), callback_data="auto_check"))
     b.row(InlineKeyboardButton(text=t("btn_back", lang), callback_data="tasks"))
     
@@ -214,7 +217,6 @@ async def auto_tasks_check(cb: types.CallbackQuery):
                 await add_balance(user['user_id'], PIARFLOW_REWARD)
                 earned_total += PIARFLOW_REWARD
                 
-                # Проверка рефералки
                 referrer_id = await process_task_completion(user['user_id'])
                 if referrer_id:
                     ref_user = await get_user(referrer_id)
@@ -357,7 +359,6 @@ async def sub_approve(cb: types.CallbackQuery):
     task = await get_task(sub['task_id'])
     await add_balance(sub['user_id'], float(task['reward']))
     
-    # Проверка рефералки
     referrer_id = await process_task_completion(sub['user_id'])
     if referrer_id:
         ref_user = await get_user(referrer_id)
