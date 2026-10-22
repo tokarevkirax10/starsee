@@ -23,6 +23,7 @@ logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
+# Временное хранилище ссылок для проверки (в памяти)
 user_pending_links = {}
 
 class AdminStates(StatesGroup):
@@ -157,6 +158,16 @@ async def tasks_menu(cb: types.CallbackQuery):
     await cb.answer()
 
 # ===== АВТОМАТИЧЕСКИЕ ЗАДАНИЯ (PiarFlow) =====
+def build_auto_keyboard(links, lang):
+    b = InlineKeyboardBuilder()
+    for i, link in enumerate(links):
+        b.row(
+            InlineKeyboardButton(text=t("auto_tasks_btn_go", lang), url=link),
+            InlineKeyboardButton(text=t("auto_tasks_btn_check", lang), callback_data=f"auto_check_{i}")
+        )
+    b.row(InlineKeyboardButton(text=t("btn_back", lang), callback_data="tasks"))
+    return b.as_markup()
+
 @dp.callback_query(F.data == "tasks_auto")
 async def auto_tasks_list(cb: types.CallbackQuery):
     user = await get_user(cb.from_user.id)
@@ -171,69 +182,92 @@ async def auto_tasks_list(cb: types.CallbackQuery):
         await cb.message.edit_text(t("auto_tasks_empty", lang), reply_markup=b.as_markup())
         await cb.answer()
         return
-    
-    links = [s["link"] for s in sponsors]
-    user_pending_links[user['user_id']] = links
-    
-    # Убрали вывод длинных ссылок в текст!
-    text = t("auto_tasks_ready", lang)
-    
-    b = InlineKeyboardBuilder()
+        
+    # Фильтруем уже выполненные задания
+    active_links = []
     for s in sponsors:
-        # Заменили эмодзи на ракету
-        b.row(InlineKeyboardButton(text=f"🚀 Перейти", url=s["link"]))
-    b.row(InlineKeyboardButton(text=t("auto_tasks_check", lang), callback_data="auto_check"))
-    b.row(InlineKeyboardButton(text=t("btn_back", lang), callback_data="tasks"))
+        existing = await get_user_task(user['user_id'], s["link"])
+        if not existing:
+            active_links.append(s["link"])
+            
+    if not active_links:
+        b = InlineKeyboardBuilder()
+        b.row(InlineKeyboardButton(text=t("btn_back", lang), callback_data="tasks"))
+        await cb.message.edit_text(t("auto_tasks_empty", lang), reply_markup=b.as_markup())
+        await cb.answer()
+        return
+        
+    user_pending_links[user['user_id']] = active_links
     
-    await cb.message.edit_text(text, reply_markup=b.as_markup())
+    text = t("auto_tasks_ready", lang)
+    keyboard = build_auto_keyboard(active_links, lang)
+    
+    await cb.message.edit_text(text, reply_markup=keyboard)
     await cb.answer()
 
-@dp.callback_query(F.data == "auto_check")
+@dp.callback_query(F.data.startswith("auto_check_"))
 async def auto_tasks_check(cb: types.CallbackQuery):
     user = await get_user(cb.from_user.id)
     lang = user['lang']
-    links = user_pending_links.get(user['user_id'], [])
     
+    links = user_pending_links.get(user['user_id'], [])
     if not links:
-        await cb.answer("❌ Нет активных заданий для проверки", show_alert=True)
+        await cb.answer("❌ Список заданий пуст или устарел. Нажми 'Автоматические' заново.", show_alert=True)
         return
         
-    res = await piarflow.check_sponsors(user['user_id'], links)
+    index = int(cb.data.split("_")[2])
+    if index >= len(links):
+        await cb.answer("❌ Ошибка. Попробуй обновить список.", show_alert=True)
+        return
+        
+    link = links[index]
+    
+    # Проверяем конкретную ссылку
+    res = await piarflow.check_sponsors(user['user_id'], [link])
     
     if not res or res.get("status") != "ok":
         await cb.answer("❌ Ошибка проверки. Попробуй позже.", show_alert=True)
         return
         
     sponsors = res.get("sponsors", [])
-    all_subbed = all(s.get("status") == "subscribed" for s in sponsors) if sponsors else False
+    if not sponsors:
+        await cb.answer("❌ Задание не найдено.", show_alert=True)
+        return
+        
+    status = sponsors[0].get("status")
     
-    if all_subbed:
-        earned_total = 0
-        for s in sponsors:
-            link = s["link"]
-            existing = await get_user_task(user['user_id'], link)
-            if not existing:
-                await add_user_task(user['user_id'], link, PIARFLOW_REWARD)
-                await add_balance(user['user_id'], PIARFLOW_REWARD)
-                earned_total += PIARFLOW_REWARD
-                
-                referrer_id = await process_task_completion(user['user_id'])
-                if referrer_id:
-                    ref_user = await get_user(referrer_id)
-                    try:
-                        await bot.send_message(referrer_id, t("ref_bonus_received", ref_user['lang']).format(REFERRAL_TASKS_REQUIRED, REFERRAL_BONUS))
-                    except Exception:
-                        pass
-                
-        if earned_total > 0:
-            await cb.message.edit_text(t("auto_tasks_success", lang).format(f"{earned_total:.2f}"))
+    if status == "subscribed":
+        existing = await get_user_task(user['user_id'], link)
+        if existing:
+            await cb.answer("✅ Ты уже получил награду за это задание.", show_alert=True)
+            # Убираем из списка на всякий случай
+            links.pop(index)
+            await cb.message.edit_reply_markup(reply_markup=build_auto_keyboard(links, lang))
         else:
-            await cb.message.edit_text("✅ Все задания уже выполнены ранее.")
-        user_pending_links.pop(user['user_id'], None)
+            await add_user_task(user['user_id'], link, PIARFLOW_REWARD)
+            await add_balance(user['user_id'], PIARFLOW_REWARD)
+            
+            referrer_id = await process_task_completion(user['user_id'])
+            if referrer_id:
+                ref_user = await get_user(referrer_id)
+                try:
+                    await bot.send_message(referrer_id, t("ref_bonus_received", ref_user['lang']).format(REFERRAL_TASKS_REQUIRED, REFERRAL_BONUS))
+                except Exception:
+                    pass
+            
+            await cb.answer(f"✅ Начислено {PIARFLOW_REWARD:.2f} ⭐️", show_alert=True)
+            
+            # Убираем кнопку выполненного задания
+            links.pop(index)
+            if links:
+                await cb.message.edit_reply_markup(reply_markup=build_auto_keyboard(links, lang))
+            else:
+                await cb.message.edit_text("✅ Все доступные задания выполнены! Возвращайся позже.")
+                user_pending_links.pop(user['user_id'], None)
+    elif status == "not_counted":
+        await cb.answer("⚠️ Задание не засчитано. Попробуй позже или напиши в поддержку.", show_alert=True)
     else:
-        await cb.answer(t("auto_tasks_fail", lang), show_alert=True)
-    
-    await cb.answer()
+        await cb.answer("❌ Задание не выполнено. Подпишись и попробуй снова.", show_alert=True)
 
 # ===== РУЧНЫЕ ЗАДАНИЯ (для юзера) =====
 @dp.callback_query(F.data == "tasks_manual")
