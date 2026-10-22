@@ -23,7 +23,6 @@ logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Временное хранилище ссылок для проверки (в памяти)
 user_pending_links = {}
 
 class AdminStates(StatesGroup):
@@ -62,6 +61,23 @@ def main_menu_text(user):
         f"{t('choose_action', lang)}"
     )
 
+# ===== ХЕЛПЕР ДЛЯ ПАРСИНГА ЧИСЕЛ =====
+def parse_reward(text: str) -> float | None:
+    text = text.strip().lower().replace(",", ".")
+    # Заменяем русские слова на цифры
+    replacements = {
+        "десять": "10", "пять": "5", "два": "2", "один": "1", 
+        "двадцать": "20", "пятьдесят": "50", "сто": "100"
+    }
+    for word, num in replacements.items():
+        if word in text:
+            text = text.replace(word, num)
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+# ===== START =====
 @dp.message(CommandStart())
 async def start_cmd(message: Message):
     args = message.text.split()
@@ -69,6 +85,16 @@ async def start_cmd(message: Message):
     await create_user(message.from_user.id, message.from_user.username, referrer)
     user = await get_user(message.from_user.id)
     await message.answer(main_menu_text(user), reply_markup=get_main_menu(user['lang']))
+
+# ===== ОТМЕНА ДЕЙСТВИЙ =====
+@dp.message(Command("cancel"))
+async def cmd_cancel(message: Message, state: FSMContext):
+    await state.clear()
+    user = await get_user(message.from_user.id)
+    lang = user['lang'] if user else "ru"
+    b = InlineKeyboardBuilder()
+    b.row(InlineKeyboardButton(text=t("btn_back", lang), callback_data="back_to_main"))
+    await message.answer("❌ Действие отменено.", reply_markup=b.as_markup())
 
 # ===== НАВИГАЦИЯ =====
 @dp.callback_query(F.data == "back_to_main")
@@ -129,17 +155,14 @@ async def change_lang(cb: types.CallbackQuery):
 async def refs_menu(cb: types.CallbackQuery):
     user = await get_user(cb.from_user.id)
     lang = user['lang']
-    
     link = f"https://t.me/{BOT_USERNAME}?start={user['user_id']}"
     invited, earned = await get_ref_stats(user['user_id'])
-    
     text = (
         f"{t('ref_title', lang)}\n\n"
         f"{t('ref_desc', lang).format(REFERRAL_BONUS, REFERRAL_TASKS_REQUIRED)}\n\n"
         f"{t('ref_link', lang).format(link)}\n\n"
         f"{t('ref_stats', lang).format(invited, f'{earned:.2f}')}"
     )
-    
     b = InlineKeyboardBuilder()
     b.row(InlineKeyboardButton(text=t("btn_back", lang), callback_data="back_to_main"))
     await cb.message.edit_text(text, reply_markup=b.as_markup(), parse_mode="Markdown")
@@ -183,7 +206,6 @@ async def auto_tasks_list(cb: types.CallbackQuery):
         await cb.answer()
         return
         
-    # Фильтруем уже выполненные задания
     active_links = []
     for s in sponsors:
         existing = await get_user_task(user['user_id'], s["link"])
@@ -198,7 +220,6 @@ async def auto_tasks_list(cb: types.CallbackQuery):
         return
         
     user_pending_links[user['user_id']] = active_links
-    
     text = t("auto_tasks_ready", lang)
     keyboard = build_auto_keyboard(active_links, lang)
     
@@ -212,7 +233,7 @@ async def auto_tasks_check(cb: types.CallbackQuery):
     
     links = user_pending_links.get(user['user_id'], [])
     if not links:
-        await cb.answer("❌ Список заданий пуст или устарел. Нажми 'Автоматические' заново.", show_alert=True)
+        await cb.answer("❌ Список заданий пуст или устарел.", show_alert=True)
         return
         
     index = int(cb.data.split("_")[2])
@@ -221,8 +242,6 @@ async def auto_tasks_check(cb: types.CallbackQuery):
         return
         
     link = links[index]
-    
-    # Проверяем конкретную ссылку
     res = await piarflow.check_sponsors(user['user_id'], [link])
     
     if not res or res.get("status") != "ok":
@@ -240,7 +259,6 @@ async def auto_tasks_check(cb: types.CallbackQuery):
         existing = await get_user_task(user['user_id'], link)
         if existing:
             await cb.answer("✅ Ты уже получил награду за это задание.", show_alert=True)
-            # Убираем из списка на всякий случай
             links.pop(index)
             await cb.message.edit_reply_markup(reply_markup=build_auto_keyboard(links, lang))
         else:
@@ -256,8 +274,6 @@ async def auto_tasks_check(cb: types.CallbackQuery):
                     pass
             
             await cb.answer(f"✅ Начислено {PIARFLOW_REWARD:.2f} ⭐️", show_alert=True)
-            
-            # Убираем кнопку выполненного задания
             links.pop(index)
             if links:
                 await cb.message.edit_reply_markup(reply_markup=build_auto_keyboard(links, lang))
@@ -265,7 +281,7 @@ async def auto_tasks_check(cb: types.CallbackQuery):
                 await cb.message.edit_text("✅ Все доступные задания выполнены! Возвращайся позже.")
                 user_pending_links.pop(user['user_id'], None)
     elif status == "not_counted":
-        await cb.answer("⚠️ Задание не засчитано. Попробуй позже или напиши в поддержку.", show_alert=True)
+        await cb.answer("⚠️ Задание не засчитано.", show_alert=True)
     else:
         await cb.answer("❌ Задание не выполнено. Подпишись и попробуй снова.", show_alert=True)
 
@@ -447,7 +463,10 @@ async def admin_add_start(cb: types.CallbackQuery, state: FSMContext):
     if cb.from_user.id not in ADMIN_IDS: return
     user = await get_user(cb.from_user.id)
     await state.set_state(AdminStates.add_title)
-    await cb.message.edit_text(t("admin_enter_title", user['lang']))
+    # Добавил кнопку отмены прямо в сообщение с шагом
+    b = InlineKeyboardBuilder()
+    b.row(InlineKeyboardButton(text="❌ Отмена", callback_data="back_to_main"))
+    await cb.message.edit_text(t("admin_enter_title", user['lang']), reply_markup=b.as_markup())
     await cb.answer()
 
 @dp.message(AdminStates.add_title)
@@ -455,28 +474,33 @@ async def admin_add_title(message: Message, state: FSMContext):
     await state.update_data(title=message.text)
     user = await get_user(message.from_user.id)
     await state.set_state(AdminStates.add_link)
-    await message.answer(t("admin_enter_link", user['lang']))
+    b = InlineKeyboardBuilder()
+    b.row(InlineKeyboardButton(text="❌ Отмена", callback_data="back_to_main"))
+    await message.answer(t("admin_enter_link", user['lang']), reply_markup=b.as_markup())
 
 @dp.message(AdminStates.add_link)
 async def admin_add_link(message: Message, state: FSMContext):
     await state.update_data(link=message.text)
     user = await get_user(message.from_user.id)
     await state.set_state(AdminStates.add_desc)
-    await message.answer(t("admin_enter_desc", user['lang']))
+    b = InlineKeyboardBuilder()
+    b.row(InlineKeyboardButton(text="❌ Отмена", callback_data="back_to_main"))
+    await message.answer(t("admin_enter_desc", user['lang']), reply_markup=b.as_markup())
 
 @dp.message(AdminStates.add_desc)
 async def admin_add_desc(message: Message, state: FSMContext):
     await state.update_data(desc=message.text)
     user = await get_user(message.from_user.id)
     await state.set_state(AdminStates.add_reward)
-    await message.answer(t("admin_enter_reward", user['lang']))
+    b = InlineKeyboardBuilder()
+    b.row(InlineKeyboardButton(text="❌ Отмена", callback_data="back_to_main"))
+    await message.answer(t("admin_enter_reward", user['lang']), reply_markup=b.as_markup())
 
 @dp.message(AdminStates.add_reward)
 async def admin_add_reward(message: Message, state: FSMContext):
-    try:
-        reward = float(message.text.replace(",", "."))
-    except ValueError:
-        await message.answer("❌ Введи число, например 5.00")
+    reward = parse_reward(message.text)
+    if reward is None:
+        await message.answer("❌ Не понял число. Введи цифрами, например: 5.00 или 10")
         return
     data = await state.get_data()
     await create_task(data['title'], data['link'], data['desc'], reward)
@@ -552,19 +576,18 @@ async def withdraw_25(cb: types.CallbackQuery):
 @dp.callback_query(F.data == "wdraw_custom")
 async def withdraw_custom(cb: types.CallbackQuery, state: FSMContext):
     await state.set_state(WithdrawState.waiting_amount)
-    await cb.message.edit_text("Введи сумму (от 50):")
+    b = InlineKeyboardBuilder()
+    b.row(InlineKeyboardButton(text="❌ Отмена", callback_data="back_to_main"))
+    await cb.message.edit_text("Введи сумму (от 50):", reply_markup=b.as_markup())
     await cb.answer()
 
 @dp.message(WithdrawState.waiting_amount)
 async def withdraw_amount(message: Message, state: FSMContext):
     user = await get_user(message.from_user.id)
     lang = user['lang']
-    try:
-        amount = float(message.text.replace(",", "."))
-    except ValueError:
-        await message.answer(t("invalid_amount", lang))
-        return
-    if amount < 50:
+    amount = parse_reward(message.text)
+    
+    if amount is None or amount < 50:
         await message.answer(t("invalid_amount", lang))
         return
     if float(user['balance']) < amount:
