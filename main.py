@@ -7,14 +7,16 @@ from aiogram.types import InlineKeyboardButton, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+from aiogram.exceptions import TelegramRetryAfter, TelegramForbiddenError, TelegramBadRequest
 
-from config import BOT_TOKEN, PORT, ADMIN_IDS, PIARFLOW_REWARD, REFERRAL_BONUS, REFERRAL_TASKS_REQUIRED, BOT_USERNAME
+from config import BOT_TOKEN, PORT, ADMIN_IDS, PIARFLOW_REWARD, REFERRAL_BONUS, REFERRAL_TASKS_REQUIRED, BOT_USERNAME, MIN_WITHDRAW
 from database import (
     init_db, get_user, create_user, update_lang, add_balance, deduct_balance,
     get_active_tasks, get_task, create_task, delete_task,
     has_pending_submission, has_recent_submission, create_submission,
     get_submission, process_submission, count_user_stats, get_global_stats,
-    add_user_task, get_user_task, process_task_completion, get_ref_stats
+    add_user_task, get_user_task, process_task_completion, get_ref_stats, get_all_user_ids,
+    create_promo, activate_promo
 )
 from locales import t
 import piarflow
@@ -24,16 +26,23 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 user_pending_links = {}
+last_known_tasks = set()
 
 class AdminStates(StatesGroup):
     add_title = State()
     add_link = State()
     add_desc = State()
     add_reward = State()
-    quick_add = State() # Новое состояние для быстрого добавления
+    quick_add = State()
+    broadcast = State()
+    promo_word = State()
+    promo_reward = State()
 
 class WithdrawState(StatesGroup):
     waiting_amount = State()
+
+class PromoState(StatesGroup):
+    waiting_code = State()
 
 # ===== МЕНЮ =====
 def get_main_menu(lang="ru"):
@@ -45,12 +54,13 @@ def get_main_menu(lang="ru"):
     )
     b.row(
         InlineKeyboardButton(text=t("btn_withdraw", lang), callback_data="withdraw"),
-        InlineKeyboardButton(text=t("btn_rules", lang), callback_data="rules")
+        InlineKeyboardButton(text=t("btn_promo", lang), callback_data="promo")
     )
     b.row(
-        InlineKeyboardButton(text=t("btn_lang", lang), callback_data="lang"),
-        InlineKeyboardButton(text=t("btn_about", lang), callback_data="about")
+        InlineKeyboardButton(text=t("btn_rules", lang), callback_data="rules"),
+        InlineKeyboardButton(text=t("btn_lang", lang), callback_data="lang")
     )
+    b.row(InlineKeyboardButton(text=t("btn_about", lang), callback_data="about"))
     return b.as_markup()
 
 def main_menu_text(user):
@@ -64,17 +74,11 @@ def main_menu_text(user):
 
 def parse_reward(text: str) -> float | None:
     text = text.strip().lower().replace(",", ".")
-    replacements = {
-        "десять": "10", "пять": "5", "два": "2", "один": "1", 
-        "двадцать": "20", "пятьдесят": "50", "сто": "100"
-    }
+    replacements = {"десять": "10", "пять": "5", "два": "2", "один": "1", "двадцать": "20", "пятьдесят": "50", "сто": "100"}
     for word, num in replacements.items():
-        if word in text:
-            text = text.replace(word, num)
-    try:
-        return float(text)
-    except ValueError:
-        return None
+        if word in text: text = text.replace(word, num)
+    try: return float(text)
+    except ValueError: return None
 
 @dp.message(CommandStart())
 async def start_cmd(message: Message):
@@ -92,6 +96,73 @@ async def cmd_cancel(message: Message, state: FSMContext):
     b = InlineKeyboardBuilder()
     b.row(InlineKeyboardButton(text=t("btn_back", lang), callback_data="back_to_main"))
     await message.answer("❌ Действие отменено.", reply_markup=b.as_markup())
+
+@dp.message(Command("broadcast"))
+async def cmd_broadcast(message: Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS: return
+    await state.set_state(AdminStates.broadcast)
+    b = InlineKeyboardBuilder()
+    b.row(InlineKeyboardButton(text="❌ Отмена", callback_data="back_to_main"))
+    await message.answer(t("broadcast_prompt", "ru"), reply_markup=b.as_markup())
+
+@dp.message(AdminStates.broadcast)
+async def process_broadcast(message: Message, state: FSMContext):
+    await state.clear()
+    user_ids = await get_all_user_ids()
+    status_msg = await message.answer(t("broadcast_started", "ru"))
+    success = 0
+    errors = 0
+    
+    for uid in user_ids:
+        try:
+            await message.copy_to(chat_id=uid)
+            success += 1
+            await asyncio.sleep(0.05)
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(e.retry_after)
+            try:
+                await message.copy_to(chat_id=uid)
+                success += 1
+            except: errors += 1
+        except (TelegramForbiddenError, TelegramBadRequest):
+            errors += 1
+        except Exception:
+            errors += 1
+            
+    await status_msg.edit_text(t("broadcast_finished", "ru").format(success, errors))
+
+# ===== ПРОМОКОДЫ (ПОЛЬЗОВАТЕЛЬ) =====
+@dp.callback_query(F.data == "promo")
+async def promo_menu(cb: types.CallbackQuery):
+    user = await get_user(cb.from_user.id)
+    lang = user['lang']
+    await cb.message.edit_text(t("promo_enter", lang))
+    await PromoState.waiting_code.set()
+
+@dp.message(PromoState.waiting_code)
+async def process_promo(message: Message, state: FSMContext):
+    user = await get_user(message.from_user.id)
+    lang = user['lang']
+    code = message.text.strip().upper()
+    
+    result = await activate_promo(code, user['user_id'])
+    
+    if result == "success":
+        promo = await get_user(message.from_user.id) # обновляем баланс в базе
+        # Получаем награду (можно запросить из базы заново или упрощенно)
+        await message.answer(t("promo_success", lang).format("1.00"))
+    elif result == "used":
+        await message.answer(t("promo_used", lang))
+    elif result == "expired":
+        await message.answer(t("promo_expired", lang))
+    else:
+        await message.answer(t("promo_not_found", lang))
+    
+    await state.clear()
+    # Обновляем меню
+    b = InlineKeyboardBuilder()
+    b.row(InlineKeyboardButton(text=t("btn_back", lang), callback_data="back_to_main"))
+    await message.answer(main_menu_text(await get_user(message.from_user.id)), reply_markup=get_main_menu(lang))
 
 # ===== НАВИГАЦИЯ =====
 @dp.callback_query(F.data == "back_to_main")
@@ -188,26 +259,28 @@ def build_auto_keyboard(links, lang):
     b.row(InlineKeyboardButton(text=t("btn_back", lang), callback_data="tasks"))
     return b.as_markup()
 
+async def get_sorted_active_links(user_id):
+    res = await piarflow.get_sponsors(user_id, user_id)
+    sponsors = res.get("sponsors") if res and res.get("status") == "ok" else []
+    active_links = []
+    piarflow_bot_link = None
+    for s in sponsors:
+        existing = await get_user_task(user_id, s["link"])
+        if not existing:
+            if "PiarFlowBot" in s["link"]:
+                piarflow_bot_link = s["link"]
+            else:
+                active_links.append(s["link"])
+    if piarflow_bot_link:
+        active_links.append(piarflow_bot_link)
+    return active_links
+
 @dp.callback_query(F.data == "tasks_auto")
 async def auto_tasks_list(cb: types.CallbackQuery):
     user = await get_user(cb.from_user.id)
     lang = user['lang']
-    res = await piarflow.get_sponsors(user['user_id'], cb.message.chat.id)
-    sponsors = res.get("sponsors") if res and res.get("status") == "ok" else []
+    active_links = await get_sorted_active_links(user['user_id'])
     
-    if not sponsors:
-        b = InlineKeyboardBuilder()
-        b.row(InlineKeyboardButton(text=t("btn_back", lang), callback_data="tasks"))
-        await cb.message.edit_text(t("auto_tasks_empty", lang), reply_markup=b.as_markup())
-        await cb.answer()
-        return
-        
-    active_links = []
-    for s in sponsors:
-        existing = await get_user_task(user['user_id'], s["link"])
-        if not existing:
-            active_links.append(s["link"])
-            
     if not active_links:
         b = InlineKeyboardBuilder()
         b.row(InlineKeyboardButton(text=t("btn_back", lang), callback_data="tasks"))
@@ -218,7 +291,10 @@ async def auto_tasks_list(cb: types.CallbackQuery):
     user_pending_links[user['user_id']] = active_links
     text = t("auto_tasks_ready", lang)
     keyboard = build_auto_keyboard(active_links, lang)
-    await cb.message.edit_text(text, reply_markup=keyboard)
+    try:
+        await cb.message.edit_text(text, reply_markup=keyboard)
+    except TelegramBadRequest:
+        pass
     await cb.answer()
 
 @dp.callback_query(F.data.startswith("auto_check_"))
@@ -227,14 +303,17 @@ async def auto_tasks_check(cb: types.CallbackQuery):
     lang = user['lang']
     links = user_pending_links.get(user['user_id'], [])
     if not links:
-        await cb.answer("❌ Список заданий пуст или устарел.", show_alert=True)
+        await cb.answer("❌ Список заданий пуст. Обновляю...", show_alert=False)
+        await auto_tasks_list(cb)
         return
     index = int(cb.data.split("_")[2])
     if index >= len(links):
-        await cb.answer("❌ Ошибка. Попробуй обновить список.", show_alert=True)
+        await cb.answer("❌ Ошибка. Обновляю список...", show_alert=False)
+        await auto_tasks_list(cb)
         return
     link = links[index]
     res = await piarflow.check_sponsors(user['user_id'], [link])
+    
     if not res or res.get("status") != "ok":
         await cb.answer("❌ Ошибка проверки. Попробуй позже.", show_alert=True)
         return
@@ -243,12 +322,11 @@ async def auto_tasks_check(cb: types.CallbackQuery):
         await cb.answer("❌ Задание не найдено.", show_alert=True)
         return
     status = sponsors[0].get("status")
+    
     if status == "subscribed":
         existing = await get_user_task(user['user_id'], link)
         if existing:
             await cb.answer("✅ Ты уже получил награду за это задание.", show_alert=True)
-            links.pop(index)
-            await cb.message.edit_reply_markup(reply_markup=build_auto_keyboard(links, lang))
         else:
             await add_user_task(user['user_id'], link, PIARFLOW_REWARD)
             await add_balance(user['user_id'], PIARFLOW_REWARD)
@@ -260,16 +338,28 @@ async def auto_tasks_check(cb: types.CallbackQuery):
                 except Exception:
                     pass
             await cb.answer(f"✅ Начислено {PIARFLOW_REWARD:.2f} ⭐️", show_alert=True)
-            links.pop(index)
-            if links:
-                await cb.message.edit_reply_markup(reply_markup=build_auto_keyboard(links, lang))
-            else:
-                await cb.message.edit_text("✅ Все доступные задания выполнены! Возвращайся позже.")
-                user_pending_links.pop(user['user_id'], None)
+            
+        new_links = await get_sorted_active_links(user['user_id'])
+        user_pending_links[user['user_id']] = new_links
+        if new_links:
+            try:
+                await cb.message.edit_reply_markup(reply_markup=build_auto_keyboard(new_links, lang))
+            except TelegramBadRequest:
+                pass
+        else:
+            await cb.message.edit_text("✅ Все доступные задания выполнены! Возвращайся позже.")
+            user_pending_links.pop(user['user_id'], None)
     elif status == "not_counted":
         await cb.answer("⚠️ Задание не засчитано.", show_alert=True)
     else:
         await cb.answer("❌ Задание не выполнено. Подпишись и попробуй снова.", show_alert=True)
+        new_links = await get_sorted_active_links(user['user_id'])
+        user_pending_links[user['user_id']] = new_links
+        if new_links:
+            try:
+                await cb.message.edit_reply_markup(reply_markup=build_auto_keyboard(new_links, lang))
+            except TelegramBadRequest:
+                pass
 
 # ===== ПРЕМИУМ ЗАДАНИЯ (для юзера) =====
 @dp.callback_query(F.data == "tasks_manual")
@@ -427,10 +517,49 @@ async def admin_panel(message: Message):
     user = await get_user(message.from_user.id)
     lang = user['lang'] if user else "ru"
     b = InlineKeyboardBuilder()
+    b.row(InlineKeyboardButton(text="📢 Сделать рассылку", callback_data="admin_broadcast_info"))
+    b.row(InlineKeyboardButton(text="🏷 Создать промокод", callback_data="admin_create_promo"))
     b.row(InlineKeyboardButton(text="⚡️ Добавить (1 сообщением)", callback_data="admin_quick_add"))
     b.row(InlineKeyboardButton(text=t("admin_add_task", lang), callback_data="admin_add"))
     b.row(InlineKeyboardButton(text=t("admin_del_task", lang), callback_data="admin_del_list"))
     await message.answer(t("admin_panel", lang), reply_markup=b.as_markup())
+
+@dp.callback_query(F.data == "admin_broadcast_info")
+async def admin_broadcast_info(cb: types.CallbackQuery):
+    await cb.answer("Напиши команду /broadcast в чат", show_alert=True)
+
+@dp.callback_query(F.data == "admin_create_promo")
+async def admin_promo_start(cb: types.CallbackQuery, state: FSMContext):
+    if cb.from_user.id not in ADMIN_IDS: return
+    await state.set_state(AdminStates.promo_word)
+    b = InlineKeyboardBuilder()
+    b.row(InlineKeyboardButton(text="❌ Отмена", callback_data="back_to_main"))
+    await cb.message.edit_text(t("admin_promo_word", "ru"), reply_markup=b.as_markup())
+    await cb.answer()
+
+@dp.message(AdminStates.promo_word)
+async def admin_promo_word(message: Message, state: FSMContext):
+    await state.update_data(promo_word=message.text.strip().upper())
+    await state.set_state(AdminStates.promo_reward)
+    b = InlineKeyboardBuilder()
+    b.row(InlineKeyboardButton(text="❌ Отмена", callback_data="back_to_main"))
+    await message.answer(t("admin_promo_reward", "ru"), reply_markup=b.as_markup())
+
+@dp.message(AdminStates.promo_reward)
+async def admin_promo_reward(message: Message, state: FSMContext):
+    reward = parse_reward(message.text)
+    if reward is None:
+        await message.answer("❌ Введи число, например 1.00")
+        return
+    data = await state.get_data()
+    code = data['promo_word']
+    success = await create_promo(code, reward)
+    
+    if success:
+        await message.answer(t("admin_promo_created", "ru").format(code, f"{reward:.2f}"), parse_mode="Markdown")
+    else:
+        await message.answer(t("admin_promo_exists", "ru"))
+    await state.clear()
 
 @dp.callback_query(F.data == "admin_quick_add")
 async def admin_quick_add(cb: types.CallbackQuery, state: FSMContext):
@@ -459,17 +588,14 @@ async def admin_quick_add_process(message: Message, state: FSMContext):
     if len(lines) < 4:
         await message.answer("❌ Ошибка. Ты прислал меньше 4 строк. Попробуй снова.")
         return
-        
     title = lines[0].strip()
     link = lines[1].strip()
     desc = lines[2].strip()
     reward_text = lines[3].strip()
-    
     reward = parse_reward(reward_text)
     if reward is None:
         await message.answer("❌ Ошибка в награде. Напиши цифру в 4-й строке.")
         return
-        
     await create_task(title, link, desc, reward)
     user = await get_user(message.from_user.id)
     await message.answer(t("admin_task_added", user['lang']))
@@ -567,7 +693,7 @@ async def withdraw_menu(cb: types.CallbackQuery):
     user = await get_user(cb.from_user.id)
     lang = user['lang']
     b = InlineKeyboardBuilder()
-    b.row(InlineKeyboardButton(text=t("withdraw_25", lang), callback_data="wdraw_25"))
+    b.row(InlineKeyboardButton(text=t("withdraw_15", lang), callback_data="wdraw_15"))
     b.row(InlineKeyboardButton(text=t("withdraw_custom", lang), callback_data="wdraw_custom"))
     b.row(InlineKeyboardButton(text=t("btn_back", lang), callback_data="back_to_main"))
     await cb.message.edit_text(
@@ -576,17 +702,17 @@ async def withdraw_menu(cb: types.CallbackQuery):
     )
     await cb.answer()
 
-@dp.callback_query(F.data == "wdraw_25")
-async def withdraw_25(cb: types.CallbackQuery):
+@dp.callback_query(F.data == "wdraw_15")
+async def withdraw_15(cb: types.CallbackQuery):
     user = await get_user(cb.from_user.id)
     lang = user['lang']
-    if float(user['balance']) < 25:
+    if float(user['balance']) < MIN_WITHDRAW:
         await cb.answer(t("not_enough_balance", lang), show_alert=True)
         return
     await cb.answer(t("withdraw_request_sent", lang), show_alert=True)
     for admin_id in ADMIN_IDS:
         try:
-            await bot.send_message(admin_id, f"💸 Заявка на вывод: @{cb.from_user.username} (ID: {cb.from_user.id})\nСумма: 25 ⭐️\nБаланс: {float(user['balance']):.2f} ⭐️")
+            await bot.send_message(admin_id, f"💸 Заявка на вывод: @{cb.from_user.username} (ID: {cb.from_user.id})\nСумма: {MIN_WITHDRAW} ⭐️\nБаланс: {float(user['balance']):.2f} ⭐️")
         except Exception: pass
 
 @dp.callback_query(F.data == "wdraw_custom")
@@ -651,9 +777,33 @@ async def start_web_server():
     await site.start()
     logging.info(f"Web server on {PORT}")
 
+# ===== ФОНОВАЯ ПРОВЕРКА НОВЫХ ЗАДАНИЙ =====
+async def background_task_checker():
+    await asyncio.sleep(60)
+    while True:
+        try:
+            users = await get_all_user_ids()
+            if users:
+                test_uid = users[0]
+                res = await piarflow.get_sponsors(test_uid, test_uid)
+                sponsors = res.get("sponsors") if res and res.get("status") == "ok" else []
+                current_tasks = set([s["link"] for s in sponsors])
+                if last_known_tasks and not current_tasks.issubset(last_known_tasks):
+                    logging.info("Появились новые автоматические задания! Рассылаем пуш.")
+                    for uid in users:
+                        try:
+                            await bot.send_message(uid, t("new_tasks_notification", "ru"), parse_mode="Markdown")
+                            await asyncio.sleep(0.05)
+                        except: pass
+                last_known_tasks = current_tasks
+        except Exception as e:
+            logging.error(f"Ошибка в фоновой проверке: {e}")
+        await asyncio.sleep(3600)
+
 async def main():
     await init_db()
     await start_web_server()
+    asyncio.create_task(background_task_checker())
     await dp.start_polling(bot)
 
 if __name__ == "__main__":

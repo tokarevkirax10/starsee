@@ -1,4 +1,5 @@
 import asyncpg
+from datetime import datetime, timedelta
 from config import DATABASE_URL, REFERRAL_BONUS
 
 pool: asyncpg.Pool = None
@@ -18,11 +19,9 @@ async def init_db():
                 created_at TIMESTAMP DEFAULT NOW()
             )
         """)
-        
-        # МИГРАЦИЯ: Добавляем новые колонки для рефералки (безопасно для существующих таблиц)
         await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS tasks_completed INT DEFAULT 0")
         await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS referrer_paid BOOLEAN DEFAULT FALSE")
-
+        
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS manual_tasks (
                 id SERIAL PRIMARY KEY,
@@ -64,7 +63,18 @@ async def init_db():
                 created_at TIMESTAMP DEFAULT NOW()
             )
         """)
-    print("✅ БД инициализирована (с поддержкой рефералки)")
+        # НОВАЯ ТАБЛИЦА ДЛЯ ПРОМОКОДОВ
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS promocodes (
+                id SERIAL PRIMARY KEY,
+                code TEXT UNIQUE NOT NULL,
+                reward NUMERIC(10, 2) NOT NULL,
+                created_at TIMESTAMP DEFAULT NOW(),
+                expires_at TIMESTAMP NOT NULL,
+                used_by BIGINT
+            )
+        """)
+    print("✅ БД инициализирована")
 
 # --- USERS ---
 async def get_user(user_id: int):
@@ -73,9 +83,7 @@ async def get_user(user_id: int):
 
 async def create_user(user_id: int, username: str, referrer_id: int = None):
     async with pool.acquire() as conn:
-        # Защита от самого себя
-        if referrer_id == user_id:
-            referrer_id = None
+        if referrer_id == user_id: referrer_id = None
         await conn.execute(
             "INSERT INTO users (user_id, username, referrer_id) VALUES ($1, $2, $3) ON CONFLICT (user_id) DO NOTHING",
             user_id, username, referrer_id
@@ -99,15 +107,48 @@ async def deduct_balance(user_id: int, amount: float):
             amount, user_id
         )
 
+async def get_all_user_ids():
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("SELECT user_id FROM users")
+        return [row['user_id'] for row in rows]
+
+# --- PROMOCODES ---
+async def create_promo(code: str, reward: float) -> bool:
+    async with pool.acquire() as conn:
+        try:
+            expires = datetime.now() + timedelta(days=3)
+            await conn.execute(
+                "INSERT INTO promocodes (code, reward, expires_at) VALUES ($1, $2, $3)",
+                code, reward, expires
+            )
+            return True
+        except asyncpg.UniqueViolationError:
+            return False
+
+async def activate_promo(code: str, user_id: int):
+    async with pool.acquire() as conn:
+        # Ищем промокод
+        promo = await conn.fetchrow("SELECT * FROM promocodes WHERE code = $1", code)
+        if not promo:
+            return "not_found"
+        if promo['used_by'] is not None:
+            return "used"
+        if promo['expires_at'] < datetime.now():
+            return "expired"
+        
+        # Активируем
+        await conn.execute("UPDATE promocodes SET used_by = $1 WHERE id = $2", user_id, promo['id'])
+        await conn.execute(
+            "UPDATE users SET balance = balance + $1, total_earned = total_earned + $1 WHERE user_id = $2",
+            float(promo['reward']), user_id
+        )
+        return "success"
+
 # --- REFERRALS ---
 async def process_task_completion(user_id: int):
-    """Увеличивает счетчик задач и проверяет, не пора ли платить рефереру."""
     async with pool.acquire() as conn:
         await conn.execute("UPDATE users SET tasks_completed = tasks_completed + 1 WHERE user_id = $1", user_id)
-        
         user = await conn.fetchrow("SELECT tasks_completed, referrer_id, referrer_paid FROM users WHERE user_id = $1", user_id)
-        
-        # Если выполнено 5+ задач, есть реферер и ему еще не платили
         if user['tasks_completed'] >= 5 and user['referrer_id'] and not user['referrer_paid']:
             await conn.execute("UPDATE users SET balance = balance + $1, total_earned = total_earned + $1 WHERE user_id = $2", REFERRAL_BONUS, user['referrer_id'])
             await conn.execute("UPDATE users SET referrer_paid = TRUE WHERE user_id = $1", user_id)
