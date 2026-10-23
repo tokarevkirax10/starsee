@@ -148,8 +148,7 @@ async def process_promo(message: Message, state: FSMContext):
     result = await activate_promo(code, user['user_id'])
     
     if result == "success":
-        promo = await get_user(message.from_user.id) # обновляем баланс в базе
-        # Получаем награду (можно запросить из базы заново или упрощенно)
+        promo = await get_user(message.from_user.id)
         await message.answer(t("promo_success", lang).format("1.00"))
     elif result == "used":
         await message.answer(t("promo_used", lang))
@@ -159,7 +158,6 @@ async def process_promo(message: Message, state: FSMContext):
         await message.answer(t("promo_not_found", lang))
     
     await state.clear()
-    # Обновляем меню
     b = InlineKeyboardBuilder()
     b.row(InlineKeyboardButton(text=t("btn_back", lang), callback_data="back_to_main"))
     await message.answer(main_menu_text(await get_user(message.from_user.id)), reply_markup=get_main_menu(lang))
@@ -263,16 +261,15 @@ async def get_sorted_active_links(user_id):
     res = await piarflow.get_sponsors(user_id, user_id)
     sponsors = res.get("sponsors") if res and res.get("status") == "ok" else []
     active_links = []
-    piarflow_bot_link = None
+    
     for s in sponsors:
         existing = await get_user_task(user_id, s["link"])
         if not existing:
+            # ПРОПУСКАЕМ PiarFlowBot ПОЛНОСТЬЮ
             if "PiarFlowBot" in s["link"]:
-                piarflow_bot_link = s["link"]
-            else:
-                active_links.append(s["link"])
-    if piarflow_bot_link:
-        active_links.append(piarflow_bot_link)
+                continue
+            active_links.append(s["link"])
+    
     return active_links
 
 @dp.callback_query(F.data == "tasks_auto")
