@@ -1,6 +1,6 @@
 import asyncpg
 from datetime import datetime, timedelta
-from config import DATABASE_URL, REFERRAL_BONUS
+from config import DATABASE_URL, REFERRAL_BONUS, DAILY_BONUS, DAILY_TASKS_REQUIRED
 
 pool: asyncpg.Pool = None
 
@@ -19,8 +19,12 @@ async def init_db():
                 created_at TIMESTAMP DEFAULT NOW()
             )
         """)
+        # Добавляем колонки для рефералки и ежедневного бонуса
         await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS tasks_completed INT DEFAULT 0")
         await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS referrer_paid BOOLEAN DEFAULT FALSE")
+        await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS daily_tasks_completed INT DEFAULT 0")
+        await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_task_date DATE")
+        await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_checkin_date DATE")
         
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS manual_tasks (
@@ -63,7 +67,6 @@ async def init_db():
                 created_at TIMESTAMP DEFAULT NOW()
             )
         """)
-        # НОВАЯ ТАБЛИЦА ДЛЯ ПРОМОКОДОВ
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS promocodes (
                 id SERIAL PRIMARY KEY,
@@ -112,6 +115,28 @@ async def get_all_user_ids():
         rows = await conn.fetch("SELECT user_id FROM users")
         return [row['user_id'] for row in rows]
 
+# --- DAILY CHECK-IN ---
+async def claim_daily_bonus(user_id: int):
+    async with pool.acquire() as conn:
+        today = datetime.now().date()
+        user = await conn.fetchrow("SELECT daily_tasks_completed, last_task_date, last_checkin_date FROM users WHERE user_id = $1", user_id)
+        
+        # Если последний чек-ин был сегодня
+        if user['last_checkin_date'] == today:
+            return "already_claimed"
+            
+        # Проверяем задания за сегодня
+        daily_completed = 0
+        if user['last_task_date'] == today:
+            daily_completed = user['daily_tasks_completed']
+            
+        if daily_completed < DAILY_TASKS_REQUIRED:
+            return f"not_enough_tasks:{daily_completed}"
+            
+        # Начисляем бонус
+        await conn.execute("UPDATE users SET balance = balance + $1, total_earned = total_earned + $1, last_checkin_date = $2 WHERE user_id = $3", DAILY_BONUS, today, user_id)
+        return "success"
+
 # --- PROMOCODES ---
 async def create_promo(code: str, reward: float) -> bool:
     async with pool.acquire() as conn:
@@ -127,29 +152,39 @@ async def create_promo(code: str, reward: float) -> bool:
 
 async def activate_promo(code: str, user_id: int):
     async with pool.acquire() as conn:
-        # Ищем промокод
         promo = await conn.fetchrow("SELECT * FROM promocodes WHERE code = $1", code)
-        if not promo:
-            return "not_found"
-        if promo['used_by'] is not None:
-            return "used"
-        if promo['expires_at'] < datetime.now():
-            return "expired"
+        if not promo: return "not_found", 0
+        if promo['used_by'] is not None: return "used", 0
+        if promo['expires_at'] < datetime.now(): return "expired", 0
         
-        # Активируем
         await conn.execute("UPDATE promocodes SET used_by = $1 WHERE id = $2", user_id, promo['id'])
         await conn.execute(
             "UPDATE users SET balance = balance + $1, total_earned = total_earned + $1 WHERE user_id = $2",
             float(promo['reward']), user_id
         )
-        return "success"
+        return "success", float(promo['reward'])
 
-# --- REFERRALS ---
+# --- REFERRALS & TASKS ---
 async def process_task_completion(user_id: int):
     async with pool.acquire() as conn:
-        await conn.execute("UPDATE users SET tasks_completed = tasks_completed + 1 WHERE user_id = $1", user_id)
-        user = await conn.fetchrow("SELECT tasks_completed, referrer_id, referrer_paid FROM users WHERE user_id = $1", user_id)
-        if user['tasks_completed'] >= 5 and user['referrer_id'] and not user['referrer_paid']:
+        today = datetime.now().date()
+        user = await conn.fetchrow("SELECT tasks_completed, daily_tasks_completed, last_task_date, referrer_id, referrer_paid FROM users WHERE user_id = $1", user_id)
+        
+        # Логика ежедневных заданий
+        daily_completed = user['daily_tasks_completed']
+        if user['last_task_date'] != today:
+            daily_completed = 0 # Сброс на новый день
+            
+        daily_completed += 1
+        
+        await conn.execute(
+            "UPDATE users SET tasks_completed = tasks_completed + 1, daily_tasks_completed = $1, last_task_date = $2 WHERE user_id = $3",
+            daily_completed, today, user_id
+        )
+        
+        # Логика рефералки
+        new_total = user['tasks_completed'] + 1
+        if new_total >= 5 and user['referrer_id'] and not user['referrer_paid']:
             await conn.execute("UPDATE users SET balance = balance + $1, total_earned = total_earned + $1 WHERE user_id = $2", REFERRAL_BONUS, user['referrer_id'])
             await conn.execute("UPDATE users SET referrer_paid = TRUE WHERE user_id = $1", user_id)
             return user['referrer_id']

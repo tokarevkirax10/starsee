@@ -9,14 +9,14 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.exceptions import TelegramRetryAfter, TelegramForbiddenError, TelegramBadRequest
 
-from config import BOT_TOKEN, PORT, ADMIN_IDS, PIARFLOW_REWARD, REFERRAL_BONUS, REFERRAL_TASKS_REQUIRED, BOT_USERNAME, MIN_WITHDRAW
+from config import BOT_TOKEN, PORT, ADMIN_IDS, PIARFLOW_REWARD, REFERRAL_BONUS, REFERRAL_TASKS_REQUIRED, BOT_USERNAME, MIN_WITHDRAW, DAILY_BONUS, DAILY_TASKS_REQUIRED
 from database import (
     init_db, get_user, create_user, update_lang, add_balance, deduct_balance,
     get_active_tasks, get_task, create_task, delete_task,
     has_pending_submission, has_recent_submission, create_submission,
     get_submission, process_submission, count_user_stats, get_global_stats,
     add_user_task, get_user_task, process_task_completion, get_ref_stats, get_all_user_ids,
-    create_promo, activate_promo
+    create_promo, activate_promo, claim_daily_bonus
 )
 from locales import t
 import piarflow
@@ -49,18 +49,21 @@ def get_main_menu(lang="ru"):
     b = InlineKeyboardBuilder()
     b.row(InlineKeyboardButton(text=t("btn_tasks", lang), callback_data="tasks"))
     b.row(
+        InlineKeyboardButton(text=t("btn_daily", lang), callback_data="daily"),
+        InlineKeyboardButton(text=t("btn_promo", lang), callback_data="promo")
+    )
+    b.row(
         InlineKeyboardButton(text=t("btn_refs", lang), callback_data="refs"),
         InlineKeyboardButton(text=t("btn_profile", lang), callback_data="profile")
     )
     b.row(
         InlineKeyboardButton(text=t("btn_withdraw", lang), callback_data="withdraw"),
-        InlineKeyboardButton(text=t("btn_promo", lang), callback_data="promo")
+        InlineKeyboardButton(text=t("btn_rules", lang), callback_data="rules")
     )
     b.row(
-        InlineKeyboardButton(text=t("btn_rules", lang), callback_data="rules"),
-        InlineKeyboardButton(text=t("btn_lang", lang), callback_data="lang")
+        InlineKeyboardButton(text=t("btn_lang", lang), callback_data="lang"),
+        InlineKeyboardButton(text=t("btn_about", lang), callback_data="about")
     )
-    b.row(InlineKeyboardButton(text=t("btn_about", lang), callback_data="about"))
     return b.as_markup()
 
 def main_menu_text(user):
@@ -131,13 +134,35 @@ async def process_broadcast(message: Message, state: FSMContext):
             
     await status_msg.edit_text(t("broadcast_finished", "ru").format(success, errors))
 
-# ===== ПРОМОКОДЫ (ПОЛЬЗОВАТЕЛЬ) =====
-@dp.callback_query(F.data == "promo")
-async def promo_menu(cb: types.CallbackQuery):
+# ===== ЕЖЕДНЕВНЫЙ БОНУС =====
+@dp.callback_query(F.data == "daily")
+async def daily_bonus_handler(cb: types.CallbackQuery):
     user = await get_user(cb.from_user.id)
     lang = user['lang']
-    await cb.message.edit_text(t("promo_enter", lang))
-    await PromoState.waiting_code.set()
+    
+    result = await claim_daily_bonus(user['user_id'])
+    
+    if result == "success":
+        await cb.answer(t("daily_success", lang).format(DAILY_BONUS), show_alert=True)
+        user = await get_user(cb.from_user.id)
+        await cb.message.edit_text(main_menu_text(user), reply_markup=get_main_menu(lang))
+    elif result == "already_claimed":
+        await cb.answer(t("daily_already_claimed", lang), show_alert=True)
+    elif result.startswith("not_enough_tasks:"):
+        completed = result.split(":")[1]
+        await cb.answer(t("daily_not_enough", lang).format(DAILY_TASKS_REQUIRED, completed, DAILY_TASKS_REQUIRED), show_alert=True)
+
+# ===== ПРОМОКОДЫ (ПОЛЬЗОВАТЕЛЬ) =====
+@dp.callback_query(F.data == "promo")
+async def promo_menu(cb: types.CallbackQuery, state: FSMContext):
+    user = await get_user(cb.from_user.id)
+    lang = user['lang']
+    await state.set_state(PromoState.waiting_code)
+    
+    b = InlineKeyboardBuilder()
+    b.row(InlineKeyboardButton(text=t("btn_back", lang), callback_data="back_to_main"))
+    await cb.message.edit_text(t("promo_enter", lang), reply_markup=b.as_markup())
+    await cb.answer()
 
 @dp.message(PromoState.waiting_code)
 async def process_promo(message: Message, state: FSMContext):
@@ -145,14 +170,14 @@ async def process_promo(message: Message, state: FSMContext):
     lang = user['lang']
     code = message.text.strip().upper()
     
-    result = await activate_promo(code, user['user_id'])
+    # Fix: activate_promo теперь возвращает кортеж (status, reward)
+    status, reward = await activate_promo(code, user['user_id'])
     
-    if result == "success":
-        promo = await get_user(message.from_user.id)
-        await message.answer(t("promo_success", lang).format("1.00"))
-    elif result == "used":
+    if status == "success":
+        await message.answer(t("promo_success", lang).format(f"{reward:.2f}"))
+    elif status == "used":
         await message.answer(t("promo_used", lang))
-    elif result == "expired":
+    elif status == "expired":
         await message.answer(t("promo_expired", lang))
     else:
         await message.answer(t("promo_not_found", lang))
@@ -164,7 +189,8 @@ async def process_promo(message: Message, state: FSMContext):
 
 # ===== НАВИГАЦИЯ =====
 @dp.callback_query(F.data == "back_to_main")
-async def back_to_main(cb: types.CallbackQuery):
+async def back_to_main(cb: types.CallbackQuery, state: FSMContext):
+    await state.clear() # Очищаем состояния, если они были
     user = await get_user(cb.from_user.id)
     await cb.message.edit_text(main_menu_text(user), reply_markup=get_main_menu(user['lang']))
     await cb.answer()
@@ -776,31 +802,42 @@ async def start_web_server():
 
 # ===== ФОНОВАЯ ПРОВЕРКА НОВЫХ ЗАДАНИЙ =====
 async def background_task_checker():
-    await asyncio.sleep(60)
+    await asyncio.sleep(60) # Даем боту время запуститься
+    global last_known_tasks
     while True:
         try:
             users = await get_all_user_ids()
             if users:
+                # Берем первого юзера для проверки пула (у PiarFlow задания общие)
                 test_uid = users[0]
                 res = await piarflow.get_sponsors(test_uid, test_uid)
                 sponsors = res.get("sponsors") if res and res.get("status") == "ok" else []
                 current_tasks = set([s["link"] for s in sponsors])
+                
+                # Если в базе уже есть трекинг и появились новые ссылки
                 if last_known_tasks and not current_tasks.issubset(last_known_tasks):
-                    logging.info("Появились новые автоматические задания! Рассылаем пуш.")
+                    logging.info(f"Появились новые задания! Было {len(last_known_tasks)}, стало {len(current_tasks)}. Рассылка...")
                     for uid in users:
                         try:
                             await bot.send_message(uid, t("new_tasks_notification", "ru"), parse_mode="Markdown")
                             await asyncio.sleep(0.05)
                         except: pass
+                
+                # Обновляем трекер
                 last_known_tasks = current_tasks
+                logging.info(f"Фоновая проверка: отслеживается {len(last_known_tasks)} заданий.")
         except Exception as e:
             logging.error(f"Ошибка в фоновой проверке: {e}")
-        await asyncio.sleep(3600)
+        
+        await asyncio.sleep(3600) # Проверяем раз в час
 
 async def main():
     await init_db()
     await start_web_server()
+    
+    # Инициализация фонового трекера перед запуском
     asyncio.create_task(background_task_checker())
+    
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
