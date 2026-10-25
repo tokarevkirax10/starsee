@@ -134,7 +134,7 @@ async def process_broadcast(message: Message, state: FSMContext):
             
     await status_msg.edit_text(t("broadcast_finished", "ru").format(success, errors))
 
-# ===== ЕЖЕДНЕВНЫЙ БОНУС =====
+# ===== ЕЖЕДНЕВНЫЙ БОНУС (ЧЕК-ИН) =====
 @dp.callback_query(F.data == "daily")
 async def daily_bonus_handler(cb: types.CallbackQuery):
     user = await get_user(cb.from_user.id)
@@ -170,7 +170,6 @@ async def process_promo(message: Message, state: FSMContext):
     lang = user['lang']
     code = message.text.strip().upper()
     
-    # Fix: activate_promo теперь возвращает кортеж (status, reward)
     status, reward = await activate_promo(code, user['user_id'])
     
     if status == "success":
@@ -190,7 +189,7 @@ async def process_promo(message: Message, state: FSMContext):
 # ===== НАВИГАЦИЯ =====
 @dp.callback_query(F.data == "back_to_main")
 async def back_to_main(cb: types.CallbackQuery, state: FSMContext):
-    await state.clear() # Очищаем состояния, если они были
+    await state.clear()
     user = await get_user(cb.from_user.id)
     await cb.message.edit_text(main_menu_text(user), reply_markup=get_main_menu(user['lang']))
     await cb.answer()
@@ -291,7 +290,6 @@ async def get_sorted_active_links(user_id):
     for s in sponsors:
         existing = await get_user_task(user_id, s["link"])
         if not existing:
-            # ПРОПУСКАЕМ PiarFlowBot ПОЛНОСТЬЮ
             if "PiarFlowBot" in s["link"]:
                 continue
             active_links.append(s["link"])
@@ -802,19 +800,17 @@ async def start_web_server():
 
 # ===== ФОНОВАЯ ПРОВЕРКА НОВЫХ ЗАДАНИЙ =====
 async def background_task_checker():
-    await asyncio.sleep(60) # Даем боту время запуститься
+    await asyncio.sleep(60)
     global last_known_tasks
     while True:
         try:
             users = await get_all_user_ids()
             if users:
-                # Берем первого юзера для проверки пула (у PiarFlow задания общие)
                 test_uid = users[0]
                 res = await piarflow.get_sponsors(test_uid, test_uid)
                 sponsors = res.get("sponsors") if res and res.get("status") == "ok" else []
                 current_tasks = set([s["link"] for s in sponsors])
                 
-                # Если в базе уже есть трекинг и появились новые ссылки
                 if last_known_tasks and not current_tasks.issubset(last_known_tasks):
                     logging.info(f"Появились новые задания! Было {len(last_known_tasks)}, стало {len(current_tasks)}. Рассылка...")
                     for uid in users:
@@ -823,21 +819,17 @@ async def background_task_checker():
                             await asyncio.sleep(0.05)
                         except: pass
                 
-                # Обновляем трекер
                 last_known_tasks = current_tasks
                 logging.info(f"Фоновая проверка: отслеживается {len(last_known_tasks)} заданий.")
         except Exception as e:
             logging.error(f"Ошибка в фоновой проверке: {e}")
         
-        await asyncio.sleep(3600) # Проверяем раз в час
+        await asyncio.sleep(3600)
 
 async def main():
     await init_db()
     await start_web_server()
-    
-    # Инициализация фонового трекера перед запуском
     asyncio.create_task(background_task_checker())
-    
     await dp.start_polling(bot)
 
 if __name__ == "__main__":

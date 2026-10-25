@@ -17,7 +17,7 @@ ADMIN_IDS = [int(x.strip()) for x in _get("ADMIN_IDS").split(",")]
 PORT = int(os.getenv("PORT", "8080"))
 
 PIARFLOW_REWARD = 0.15
-REFERRAL_BONUS = 3.0  # Изменено с 5 на 3
+REFERRAL_BONUS = 3.0
 REFERRAL_TASKS_REQUIRED = 5
 BOT_USERNAME = "StarsMineAi"
 MIN_WITHDRAW = 15

@@ -19,7 +19,6 @@ async def init_db():
                 created_at TIMESTAMP DEFAULT NOW()
             )
         """)
-        # Добавляем колонки для рефералки и ежедневного бонуса
         await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS tasks_completed INT DEFAULT 0")
         await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS referrer_paid BOOLEAN DEFAULT FALSE")
         await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS daily_tasks_completed INT DEFAULT 0")
@@ -121,11 +120,9 @@ async def claim_daily_bonus(user_id: int):
         today = datetime.now().date()
         user = await conn.fetchrow("SELECT daily_tasks_completed, last_task_date, last_checkin_date FROM users WHERE user_id = $1", user_id)
         
-        # Если последний чек-ин был сегодня
         if user['last_checkin_date'] == today:
             return "already_claimed"
             
-        # Проверяем задания за сегодня
         daily_completed = 0
         if user['last_task_date'] == today:
             daily_completed = user['daily_tasks_completed']
@@ -133,7 +130,6 @@ async def claim_daily_bonus(user_id: int):
         if daily_completed < DAILY_TASKS_REQUIRED:
             return f"not_enough_tasks:{daily_completed}"
             
-        # Начисляем бонус
         await conn.execute("UPDATE users SET balance = balance + $1, total_earned = total_earned + $1, last_checkin_date = $2 WHERE user_id = $3", DAILY_BONUS, today, user_id)
         return "success"
 
@@ -170,10 +166,9 @@ async def process_task_completion(user_id: int):
         today = datetime.now().date()
         user = await conn.fetchrow("SELECT tasks_completed, daily_tasks_completed, last_task_date, referrer_id, referrer_paid FROM users WHERE user_id = $1", user_id)
         
-        # Логика ежедневных заданий
         daily_completed = user['daily_tasks_completed']
         if user['last_task_date'] != today:
-            daily_completed = 0 # Сброс на новый день
+            daily_completed = 0
             
         daily_completed += 1
         
@@ -182,7 +177,6 @@ async def process_task_completion(user_id: int):
             daily_completed, today, user_id
         )
         
-        # Логика рефералки
         new_total = user['tasks_completed'] + 1
         if new_total >= 5 and user['referrer_id'] and not user['referrer_paid']:
             await conn.execute("UPDATE users SET balance = balance + $1, total_earned = total_earned + $1 WHERE user_id = $2", REFERRAL_BONUS, user['referrer_id'])
