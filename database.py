@@ -24,7 +24,7 @@ async def init_db():
         await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS daily_tasks_completed INT DEFAULT 0")
         await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_task_date DATE")
         await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_checkin_date DATE")
-        
+
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS manual_tasks (
                 id SERIAL PRIMARY KEY,
@@ -47,13 +47,12 @@ async def init_db():
                 created_at TIMESTAMP DEFAULT NOW()
             )
         """)
-        # === ФИКС: чистим дубли (если кто-то успел дважды отправить) ===
+        # чистим дубли и ставим UNIQUE
         await conn.execute("""
             DELETE FROM manual_submissions a
             USING manual_submissions b
             WHERE a.id > b.id AND a.user_id = b.user_id AND a.task_id = b.task_id
         """)
-        # === ФИКС: гарантируем «одна заявка на задание = навсегда» ===
         await conn.execute("""
             CREATE UNIQUE INDEX IF NOT EXISTS uniq_user_task_submission
             ON manual_submissions (user_id, task_id)
@@ -87,7 +86,6 @@ async def init_db():
                 used_by BIGINT
             )
         """)
-        # === НОВОЕ: лог ручных начислений админом ===
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS admin_star_log (
                 id SERIAL PRIMARY KEY,
@@ -132,10 +130,18 @@ async def add_balance(user_id: int, amount: float):
         )
 
 async def add_balance_admin(user_id: int, amount: float):
-    """Ручное начисление админом — НЕ трогает total_earned."""
+    """Ручное начисление админом — НЕ трогает total_earned. amount может быть отрицательным."""
     async with pool.acquire() as conn:
         await conn.execute(
             "UPDATE users SET balance = balance + $1 WHERE user_id = $2",
+            amount, user_id
+        )
+
+async def set_balance_admin(user_id: int, amount: float):
+    """Жёстко назначает баланс (SET). total_earned НЕ трогает."""
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE users SET balance = $1 WHERE user_id = $2",
             amount, user_id
         )
 
@@ -171,17 +177,13 @@ async def claim_daily_bonus(user_id: int):
     async with pool.acquire() as conn:
         today = datetime.now().date()
         user = await conn.fetchrow("SELECT daily_tasks_completed, last_task_date, last_checkin_date FROM users WHERE user_id = $1", user_id)
-        
         if user['last_checkin_date'] == today:
             return "already_claimed"
-            
         daily_completed = 0
         if user['last_task_date'] == today:
             daily_completed = user['daily_tasks_completed']
-            
         if daily_completed < DAILY_TASKS_REQUIRED:
             return f"not_enough_tasks:{daily_completed}"
-            
         await conn.execute("UPDATE users SET balance = balance + $1, total_earned = total_earned + $1, last_checkin_date = $2 WHERE user_id = $3", DAILY_BONUS, today, user_id)
         return "success"
 
@@ -204,7 +206,6 @@ async def activate_promo(code: str, user_id: int):
         if not promo: return "not_found", 0
         if promo['used_by'] is not None: return "used", 0
         if promo['expires_at'] < datetime.now(): return "expired", 0
-        
         await conn.execute("UPDATE promocodes SET used_by = $1 WHERE id = $2", user_id, promo['id'])
         await conn.execute(
             "UPDATE users SET balance = balance + $1, total_earned = total_earned + $1 WHERE user_id = $2",
@@ -217,18 +218,14 @@ async def process_task_completion(user_id: int):
     async with pool.acquire() as conn:
         today = datetime.now().date()
         user = await conn.fetchrow("SELECT tasks_completed, daily_tasks_completed, last_task_date, referrer_id, referrer_paid FROM users WHERE user_id = $1", user_id)
-        
         daily_completed = user['daily_tasks_completed']
         if user['last_task_date'] != today:
             daily_completed = 0
-            
         daily_completed += 1
-        
         await conn.execute(
             "UPDATE users SET tasks_completed = tasks_completed + 1, daily_tasks_completed = $1, last_task_date = $2 WHERE user_id = $3",
             daily_completed, today, user_id
         )
-        
         new_total = user['tasks_completed'] + 1
         if new_total >= 5 and user['referrer_id'] and not user['referrer_paid']:
             await conn.execute("UPDATE users SET balance = balance + $1, total_earned = total_earned + $1 WHERE user_id = $2", REFERRAL_BONUS, user['referrer_id'])
@@ -272,7 +269,7 @@ async def has_pending_submission(user_id: int, task_id: int) -> bool:
         return row is not None
 
 async def has_any_submission(user_id: int, task_id: int) -> bool:
-    """ФИКС: True если есть ЛЮБАЯ заявка (pending/approved/rejected) — блокируем навсегда."""
+    """True если есть ЛЮБАЯ заявка (pending/approved/rejected) — блокируем навсегда."""
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             "SELECT id FROM manual_submissions WHERE user_id = $1 AND task_id = $2 LIMIT 1",
