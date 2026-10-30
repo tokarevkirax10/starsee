@@ -702,7 +702,7 @@ async def admin_give_start(cb: types.CallbackQuery, state: FSMContext):
     if cb.from_user.id not in ADMIN_IDS: return
     user = await get_user(cb.from_user.id)
     lang = user['lang'] if user else "ru"
-    await state.set_state(AdminStates.give_user
+    await state.set_state(AdminStates.give_user)
     b = InlineKeyboardBuilder()
     b.row(InlineKeyboardButton(text="❌ Отмена", callback_data="back_to_main"))
     await cb.message.answer(t("admin_give_user", lang), reply_markup=b.as_markup())
