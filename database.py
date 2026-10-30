@@ -47,6 +47,17 @@ async def init_db():
                 created_at TIMESTAMP DEFAULT NOW()
             )
         """)
+        # === ФИКС: чистим дубли (если кто-то успел дважды отправить) ===
+        await conn.execute("""
+            DELETE FROM manual_submissions a
+            USING manual_submissions b
+            WHERE a.id > b.id AND a.user_id = b.user_id AND a.task_id = b.task_id
+        """)
+        # === ФИКС: гарантируем «одна заявка на задание = навсегда» ===
+        await conn.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS uniq_user_task_submission
+            ON manual_submissions (user_id, task_id)
+        """)
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS withdrawal_requests (
                 id SERIAL PRIMARY KEY,
@@ -76,12 +87,29 @@ async def init_db():
                 used_by BIGINT
             )
         """)
+        # === НОВОЕ: лог ручных начислений админом ===
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS admin_star_log (
+                id SERIAL PRIMARY KEY,
+                admin_id BIGINT NOT NULL,
+                user_id BIGINT NOT NULL,
+                amount NUMERIC(10, 2) NOT NULL,
+                reason TEXT,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        """)
     print("✅ БД инициализирована")
 
 # --- USERS ---
 async def get_user(user_id: int):
     async with pool.acquire() as conn:
         return await conn.fetchrow("SELECT * FROM users WHERE user_id = $1", user_id)
+
+async def get_user_by_username(username: str):
+    async with pool.acquire() as conn:
+        return await conn.fetchrow(
+            "SELECT * FROM users WHERE LOWER(username) = LOWER($1)", username
+        )
 
 async def create_user(user_id: int, username: str, referrer_id: int = None):
     async with pool.acquire() as conn:
@@ -96,9 +124,18 @@ async def update_lang(user_id: int, lang: str):
         await conn.execute("UPDATE users SET lang = $1 WHERE user_id = $2", lang, user_id)
 
 async def add_balance(user_id: int, amount: float):
+    """Начисление за задания — увеличивает total_earned."""
     async with pool.acquire() as conn:
         await conn.execute(
             "UPDATE users SET balance = balance + $1, total_earned = total_earned + $1 WHERE user_id = $2",
+            amount, user_id
+        )
+
+async def add_balance_admin(user_id: int, amount: float):
+    """Ручное начисление админом — НЕ трогает total_earned."""
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE users SET balance = balance + $1 WHERE user_id = $2",
             amount, user_id
         )
 
@@ -113,6 +150,21 @@ async def get_all_user_ids():
     async with pool.acquire() as conn:
         rows = await conn.fetch("SELECT user_id FROM users")
         return [row['user_id'] for row in rows]
+
+# --- ADMIN STAR LOG ---
+async def log_admin_give(admin_id: int, user_id: int, amount: float, reason: str):
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO admin_star_log (admin_id, user_id, amount, reason) VALUES ($1, $2, $3, $4)",
+            admin_id, user_id, amount, reason
+        )
+
+async def get_top_users(limit: int = 20):
+    async with pool.acquire() as conn:
+        return await conn.fetch(
+            "SELECT user_id, username, balance FROM users ORDER BY balance DESC LIMIT $1",
+            limit
+        )
 
 # --- DAILY CHECK-IN ---
 async def claim_daily_bonus(user_id: int):
@@ -219,10 +271,11 @@ async def has_pending_submission(user_id: int, task_id: int) -> bool:
         )
         return row is not None
 
-async def has_recent_submission(user_id: int, task_id: int) -> bool:
+async def has_any_submission(user_id: int, task_id: int) -> bool:
+    """ФИКС: True если есть ЛЮБАЯ заявка (pending/approved/rejected) — блокируем навсегда."""
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT id FROM manual_submissions WHERE user_id = $1 AND task_id = $2 AND created_at > NOW() - INTERVAL '24 hours'",
+            "SELECT id FROM manual_submissions WHERE user_id = $1 AND task_id = $2 LIMIT 1",
             user_id, task_id
         )
         return row is not None
