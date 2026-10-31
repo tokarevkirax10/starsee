@@ -1,4 +1,4 @@
-import asyncio, logging
+import asyncio, logging, hmac, hashlib, json
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart, Command
@@ -9,7 +9,8 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.exceptions import TelegramRetryAfter, TelegramForbiddenError, TelegramBadRequest
 
 from config import (BOT_TOKEN, PORT, ADMIN_IDS, PIARFLOW_REWARD, REFERRAL_BONUS,
-    REFERRAL_TASKS_REQUIRED, BOT_USERNAME, MIN_WITHDRAW, DAILY_BONUS, DAILY_TASKS_REQUIRED)
+    REFERRAL_TASKS_REQUIRED, BOT_USERNAME, MIN_WITHDRAW, DAILY_BONUS, DAILY_TASKS_REQUIRED,
+    TONADS_PROJECT_ID, TONADS_SECRET, TONADS_REWARD)
 from database import (
     init_db, get_user, get_user_by_username, create_user, update_lang,
     add_balance, add_balance_admin, deduct_balance,
@@ -18,7 +19,8 @@ from database import (
     count_user_stats, get_global_stats, add_user_task, get_user_task,
     process_task_completion, get_ref_stats, get_all_user_ids,
     create_promo, activate_promo, claim_daily_bonus,
-    log_admin_give, get_top_users
+    log_admin_give, get_top_users,
+    is_tonads_event_processed, mark_tonads_event_processed
 )
 from locales import t
 import piarflow
@@ -206,6 +208,12 @@ async def tasks_menu(cb: types.CallbackQuery):
     b = InlineKeyboardBuilder()
     b.row(InlineKeyboardButton(text=t("tasks_auto", lang), callback_data="tasks_auto"))
     b.row(InlineKeyboardButton(text=t("tasks_manual", lang), callback_data="tasks_manual"))
+    
+    # --- НОВАЯ КНОПКА TONADS ---
+    tonads_link = f"https://t.me/tonads_bot/app?startapp=p{TONADS_PROJECT_ID}_{user['user_id']}"
+    b.row(InlineKeyboardButton(text="📺 Смотреть рекламу (TonAds)", url=tonads_link))
+    # ---------------------------
+
     b.row(InlineKeyboardButton(text=t("btn_back", lang), callback_data="back_to_main"))
     await cb.message.edit_text(t("tasks_menu", lang), reply_markup=b.as_markup())
     await cb.answer()
@@ -520,7 +528,7 @@ async def admin_do_delete(cb: types.CallbackQuery):
     await cb.answer(t("admin_task_deleted", u['lang']), show_alert=True)
     await cb.message.delete()
 
-# ===== ⚙️ АДМИН: НАЗНАЧИТЬ БАЛАНС (SET, а не add/subtract) =====
+# ===== ⚙️ АДМИН: НАЗНАЧИТЬ БАЛАНС =====
 @dp.callback_query(F.data == "admin_give_start")
 async def admin_give_start(cb: types.CallbackQuery, state: FSMContext):
     if not is_admin(cb.from_user.id): return
@@ -577,9 +585,7 @@ async def admin_give_reason(message: Message, state: FSMContext):
         return await message.answer("❌ Юзер не найден.")
     old_bal = float(old['balance'])
     delta = amount - old_bal
-    # SET: используем add_balance_admin с дельтой → balance = amount, total_earned не трогаем
     await add_balance_admin(target_id, delta)
-    # Правильный порядок аргументов: (admin_id, user_id, amount, reason)
     await log_admin_give(message.from_user.id, target_id, amount, f"[SET] {reason}")
     updated = await get_user(target_id)
     new_bal = float(updated['balance'])
@@ -621,7 +627,6 @@ async def cmd_balance(message: Message):
     elif tgt.isdigit(): target = await get_user(int(tgt))
     else: target = None
     if not target: return await message.answer(t("admin_balance_not_found", lang))
-    uname = f"@{target['username']}" if target['username'] else str(target['user_id'])
     await message.answer(t("admin_balance_result", lang).format(
         target['username'] or target['user_id'], target['user_id'], f"{float(target['balance']):.2f}"))
 
@@ -673,7 +678,7 @@ async def withdraw_amount(message: Message, state: FSMContext):
         except Exception: pass
     await state.clear()
 
-# ===== ВЕБ-СЕРВЕР / PING =====
+# ===== ВЕБ-СЕРВЕР / ВЕБХУКИ =====
 async def handle_ping(request):
     return web.Response(text="Bot is alive")
 
@@ -694,6 +699,68 @@ async def handle_piarflow_webhook(request):
     except Exception as e:
         logging.error(f"Webhook error: {e}")
         return web.json_response({"ok": False}, status=500)
+
+async def handle_tonads_webhook(request):
+    try:
+        raw_body = await request.read()
+        signature_header = request.headers.get('X-TonAds-Signature', '')
+        
+        expected_sig = hmac.new(TONADS_SECRET.encode('utf-8'), raw_body, hashlib.sha256).hexdigest()
+        expected_sig = f"sha256={expected_sig}"
+        
+        if not hmac.compare_digest(expected_sig, signature_header):
+            logging.warning("TonAds Webhook: Неверная подпись!")
+            return web.Response(status=401)
+            
+        payload = json.loads(raw_body)
+        event_id = payload.get("eventId")
+        if not event_id:
+            return web.Response(status=400)
+
+        if await is_tonads_event_processed(event_id):
+            return web.Response(status=200)
+
+        if "task_finish" in payload:
+            task = payload["task_finish"]
+            user_id_str = task.get("tgId") or task.get("payload")
+            
+            if user_id_str:
+                try:
+                    uid = int(user_id_str)
+                    await add_balance(uid, TONADS_REWARD)
+                    await process_task_completion(uid) # Начисляем выполненные задания для рефералки/чекина
+                    await mark_tonads_event_processed(event_id)
+                    
+                    user = await get_user(uid)
+                    if user:
+                        try:
+                            await bot.send_message(
+                                uid, 
+                                f"✅ Начислено {TONADS_REWARD:.2f} ⭐️ за просмотр рекламы (TonAds)!\n"
+                                f"Баланс: {float(user['balance']) + TONADS_REWARD:.2f} ⭐️"
+                            )
+                        except Exception:
+                            pass
+                    
+                    return web.json_response({
+                        "title": "✅ Награда получена!",
+                        "text": f"Вам начислено {TONADS_REWARD:.2f} ⭐️. Возвращайтесь в бота!",
+                        "link": f"https://t.me/{BOT_USERNAME}"
+                    })
+                except ValueError:
+                    logging.error(f"TonAds: Неверный ID пользователя {user_id_str}")
+            
+            return web.Response(status=200)
+
+        elif "task_payment" in payload:
+            await mark_tonads_event_processed(event_id)
+            logging.info(f"TonAds: Оплата получена {payload['task_payment'].get('amount')} USDT")
+            return web.Response(status=200)
+
+        return web.Response(status=200)
+    except Exception as e:
+        logging.error(f"TonAds webhook error: {e}")
+        return web.Response(status=500)
 
 # ===== ФОН: новые задания =====
 async def background_task_checker():
@@ -724,6 +791,7 @@ async def main():
     app = web.Application()
     app.router.add_get("/", handle_ping)
     app.router.add_post("/piarflow/webhook", handle_piarflow_webhook)
+    app.router.add_post("/tonads/webhook", handle_tonads_webhook) # <--- ДОБАВЛЕНА СТРОКА
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)

@@ -96,6 +96,13 @@ async def init_db():
                 created_at TIMESTAMP DEFAULT NOW()
             )
         """)
+        # --- НОВОЕ ДЛЯ TONADS ---
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS tonads_events (
+                event_id TEXT PRIMARY KEY,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        """)
     print("✅ БД инициализирована")
 
 # --- USERS ---
@@ -318,6 +325,19 @@ async def add_user_task(user_id: int, task_ref: str, reward: float):
 async def get_user_task(user_id: int, task_ref: str):
     async with pool.acquire() as conn:
         return await conn.fetchrow("SELECT * FROM user_tasks WHERE user_id = $1 AND task_ref = $2", user_id, task_ref)
+
+# --- TONADS EVENTS ---
+async def is_tonads_event_processed(event_id: str) -> bool:
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT event_id FROM tonads_events WHERE event_id = $1", event_id)
+        return row is not None
+
+async def mark_tonads_event_processed(event_id: str):
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO tonads_events (event_id) VALUES ($1) ON CONFLICT DO NOTHING", 
+            event_id
+        )
 
 # --- GLOBAL STATS ---
 async def get_global_stats():

@@ -12,6 +12,7 @@ def _get(name: str) -> str:
 BOT_TOKEN = _get("BOT_TOKEN")
 PIARFLOW_API_KEY = _get("PIARFLOW_API_KEY")
 DATABASE_URL = _get("DATABASE_URL")
+TONADS_SECRET = _get("TONADS_SECRET") # <--- ДОБАВЛЕНО
 
 ADMIN_IDS = [int(x.strip()) for x in _get("ADMIN_IDS").split(",")]
 PORT = int(os.getenv("PORT", "8080"))
@@ -24,3 +25,7 @@ MIN_WITHDRAW = 15
 
 DAILY_BONUS = 0.5
 DAILY_TASKS_REQUIRED = 3
+
+# --- TONADS ---
+TONADS_PROJECT_ID = "357" # Судя по твоему скрину
+TONADS_REWARD = 0.1      # Сколько звезд давать за просмотр рекламы
